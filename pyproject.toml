@@ -1,0 +1,9 @@
+[project]
+name = "balance-competition"
+version = "0.1.0"
+description = "Evolutionary algorithm for game-parameter optimisation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.33.1",
+]
