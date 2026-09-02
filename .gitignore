@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Experiment logs and results
+logs/
+results/
+
+# Local editor / tooling state
+.claude/settings.local.json
+.DS_Store
