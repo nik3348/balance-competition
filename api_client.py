@@ -1,22 +1,27 @@
-"""
-api_client.py – thin wrapper around the POST /api/run_game endpoint.
-"""
+"""Thin wrapper around the POST /api/run_game endpoint."""
+
+from __future__ import annotations
+
+import logging
+import time
 
 import requests
 
+logger = logging.getLogger(__name__)
+
 BASE_URL = "http://localhost:3000"
 
-
-# ---------------------------------------------------------------------------
-# Custom exceptions
-# ---------------------------------------------------------------------------
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2.0
+RETRYABLE_STATUS_CODES = {408, 500, 502, 503, 504}
+DEFAULT_HTTP_TIMEOUT = 600.0
 
 
 class APIError(Exception):
     """Base exception for all API errors."""
 
 
-class TimeoutError(APIError):
+class APITimeoutError(APIError):
     """Raised when the server reports a timeout (408) or the HTTP request times out."""
 
 
@@ -28,39 +33,13 @@ class ServerError(APIError):
     """Raised when the server returns a 500 Internal Server Error."""
 
 
-# ---------------------------------------------------------------------------
-# Public interface
-# ---------------------------------------------------------------------------
-
-
 def run_game(
     game: str,
     params: dict,
     run_type: str,
     timeout_ms: int = 0,
-    http_timeout: float = 120.0,
+    http_timeout: float = DEFAULT_HTTP_TIMEOUT,
 ) -> float:
-    """Run a game via the API and return the resulting score.
-
-    Args:
-        game:         Identifier of the game to run.
-        params:       Dictionary of game parameters.
-        run_type:     Execution mode (e.g. "fast", "full", …).
-        timeout_ms:   Per-game timeout in milliseconds passed to the server.
-                      0 means no server-side timeout.
-        http_timeout: Seconds to wait for the HTTP response before raising
-                      TimeoutError. Defaults to 120 s.
-
-    Returns:
-        The ``score`` float returned by the server on a 200 response.
-
-    Raises:
-        TimeoutError:    HTTP request timed out, or server returned 408.
-        BadRequestError: Server returned 400.
-        ServerError:     Server returned 500.
-        APIError:        Any other non-200 status code, or a lower-level
-                         requests exception.
-    """
     payload = {
         "game": game,
         "params": params,
@@ -68,37 +47,56 @@ def run_game(
         "timeout": timeout_ms,
     }
 
-    try:
-        response = requests.post(
-            f"{BASE_URL}/api/run_game",
-            json=payload,
-            timeout=http_timeout,
-        )
-    except requests.exceptions.Timeout as exc:
-        raise TimeoutError("HTTP request timed out") from exc
-    except requests.exceptions.RequestException as exc:
-        raise APIError(f"Request failed: {exc}") from exc
+    last_exc: Exception | None = None
 
-    # ------------------------------------------------------------------
-    # Handle success
-    # ------------------------------------------------------------------
-    if response.status_code == 200:
-        data = response.json()
-        return float(data["score"])
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                f"{BASE_URL}/api/run_game",
+                json=payload,
+                timeout=http_timeout,
+            )
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BACKOFF ** attempt
+                logger.warning("HTTP timeout on attempt %d, retrying in %.1fs", attempt + 1, wait)
+                time.sleep(wait)
+                continue
+            raise APITimeoutError("HTTP request timed out after all retries") from exc
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BACKOFF ** attempt
+                logger.warning("Request failed on attempt %d: %s, retrying in %.1fs", attempt + 1, exc, wait)
+                time.sleep(wait)
+                continue
+            raise APIError(f"Request failed after all retries: {exc}") from exc
 
-    # ------------------------------------------------------------------
-    # Handle known error status codes
-    # ------------------------------------------------------------------
-    try:
-        error_message = response.json().get("error", response.text)
-    except ValueError:
-        error_message = response.text
+        if response.status_code == 200:
+            return float(response.json()["score"])
 
-    if response.status_code == 400:
-        raise BadRequestError(error_message)
-    if response.status_code == 408:
-        raise TimeoutError(error_message)
-    if response.status_code == 500:
-        raise ServerError(error_message)
+        try:
+            error_message = response.json().get("error", response.text)
+        except ValueError:
+            error_message = response.text
 
-    raise APIError(f"Unexpected status code {response.status_code}: {error_message}")
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+            wait = RETRY_BACKOFF ** attempt
+            logger.warning(
+                "Server returned %d on attempt %d: %s, retrying in %.1fs",
+                response.status_code, attempt + 1, error_message, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code == 400:
+            raise BadRequestError(error_message)
+        if response.status_code == 408:
+            raise APITimeoutError(error_message)
+        if response.status_code == 500:
+            raise ServerError(error_message)
+
+        raise APIError(f"Unexpected status code {response.status_code}: {error_message}")
+
+    raise APIError(f"All {MAX_RETRIES} retries exhausted: {last_exc}")
